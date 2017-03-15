@@ -13,6 +13,38 @@ from ..core import task, containers
 from ..util import tools
 
 
+class ApplyScaleFactor(task.SingleTask):
+    """ Apply an overall scale factor to the visibilities.
+
+    Attributes
+    ----------
+    scale_factor : float
+        Multiply the visibilities by this number.
+    """
+
+    scale_factor = config.Property(proptype=float, default=1e7)
+    update_weight = config.Property(proptype=bool, default=False)
+
+    def process(self, tstream):
+        """
+        Parameters
+        ----------
+        tstream : containers.TimeStream or containers.SiderealStream
+
+        Returns
+        -------
+        tstream : containers.TimeStream or containers.SiderealStream
+        """
+
+        tstream.vis[:] *= self.scale_factor
+
+        if self.update_weight:
+
+            tstream.weight[:] /= self.scale_factor**2
+
+        return tstream
+
+
 class ApplyGain(task.SingleTask):
     """Apply a set of gains to a timestream or sidereal stack.
 
