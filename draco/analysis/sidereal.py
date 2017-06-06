@@ -23,6 +23,7 @@ into  :class:`SiderealGrouper`, then feeding that into
 
 import numpy as np
 import os
+import shutil
 
 from caput import config, mpiutil, mpiarray, tod
 
@@ -128,9 +129,9 @@ class SiderealGrouper(task.SingleTask):
         lsd = self._current_lsd
 
         # Calculate the length of data in this current LSD
-        start = self.observer.unix_to_lsd(self._timestream_list[0].time[0])
-        end = self.observer.unix_to_lsd(self._timestream_list[-1].time[-1])
-        day_length = min(end, lsd + 1) - max(start, lsd)
+        day_length = np.sum([max(min(lsd + 1, self.observer.unix_to_lsd(tl.time[-1])), lsd) -
+                             max(min(lsd + 1, self.observer.unix_to_lsd(tl.time[0])), lsd)
+                             for tl in self._timestream_list])
 
         if mpiutil.rank0:
             print "Day length %0.2f" % day_length
@@ -332,7 +333,7 @@ class SiderealStacker(task.SingleTask):
         if self.stack is None:
 
             if mpiutil.rank0:
-                print "Starting stack with LSD: %i" % input_lsd
+                print "Starting stack with LSD:  " + np.array2string(input_lsd, separator=', ')
 
             self.stack = containers.empty_like(sdata)
             self.stack.redistribute('freq')
@@ -347,11 +348,11 @@ class SiderealStacker(task.SingleTask):
 
             if any([ ll in self.stack.attrs['lsd'] for ll in input_lsd ]):
                 if mpiutil.rank0:
-                    print "Skipping stack of LSD: %i" % input_lsd
+                    print "Skipping stack of LSD:  " + np.array2string(input_lsd, separator=', ')
                 return
 
             if mpiutil.rank0:
-                print "Adding to stack LSD: %i" % input_lsd
+                print "Adding to stack LSD:  " + np.array2string(input_lsd, separator=', ')
 
             # note: Eventually we should fix up gains
 
@@ -395,7 +396,34 @@ class SiderealStacker(task.SingleTask):
             outfile = os.path.expanduser(outfile)
             outfile = os.path.expandvars(outfile)
 
+            # If the output file already exists, then we would like to
+            # rename it temporarily while writing the contents of the stack.
+            # We do not want to lose our progress if the job ends while writing.
+            if mpiutil.rank0:
+
+                delete_temp = False
+
+                if os.path.isfile(outfile):
+
+                    tempfile = list(os.path.splitext(outfile))
+                    tempfile.insert(-1, '_temp')
+                    tempfile = ''.join(tempfile)
+
+                    shutil.move(outfile, tempfile)
+
+                    delete_temp = True
+
+            mpiutil.barrier()
+
+            # Save checkpoint
             self.write_output(outfile, self.stack)
+
+            # Finished writing stack to disk!
+            # If necessary, delete temporary file.
+            if mpiutil.rank0 and delete_temp:
+                os.remove(tempfile)
+
+            mpiutil.barrier()
 
 
 
