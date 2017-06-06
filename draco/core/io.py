@@ -36,7 +36,7 @@ Several tasks accept groups of files as arguments. These are specified in the YA
         files: ['file1.h5', 'file2.h5']
 """
 
-import os.path
+import os
 
 import numpy as np
 
@@ -182,6 +182,7 @@ class LoadFilesFromParams(pipeline.TaskBase):
     """
 
     files = config.Property(proptype=_list_or_glob)
+    tag_search = config.Property(proptype=str, default=None)
 
     def next(self):
         """Load the given files in turn and pass on.
@@ -203,11 +204,24 @@ class LoadFilesFromParams(pipeline.TaskBase):
 
         cont = memh5.BasicCont.from_file(file_, distributed=True)
 
-        if 'tag' not in cont.attrs:
-            # Get the first part of the actual filename and use it as the tag
+        # Determine an appropriate tag for the container.
+        # First check for tag in attributes.
+        tag = cont.attrs.get('tag', None)
+
+        # If tag_search keyword has been input, then obtain tag
+        # from keyword search of the file's directories.
+        if self.tag_search is not None:
+            search_res = [tdir for tdir in os.path.normpath(file_).split(os.sep)
+                               if tdir.startswith(self.tag_search)]
+
+            if search_res:
+                tag = '_'.join(search_res)
+
+        # Otherwise, use the first part of the filename as the tag.
+        if tag is None:
             tag = os.path.splitext(os.path.basename(file_))[0]
 
-            cont.attrs['tag'] = tag
+        cont.attrs['tag'] = tag
 
         return cont
 

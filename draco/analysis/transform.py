@@ -32,6 +32,7 @@ class Rebin(task.SingleTask):
 
     channel_bin = config.Property(proptype=int, default=1)
     axis = config.Property(proptype=str, default='freq')
+    keep = config.Property(proptype=bool, default=True)
 
     def process(self, ss):
         """Take the input dataset and rebin over specificed axis.
@@ -46,6 +47,8 @@ class Rebin(task.SingleTask):
         sb : containers.SiderealStream or containers.TimeStream
             Rebinned data. Type will match the input.
         """
+
+        import gc
 
         if self.axis not in ss.index_map:
             raise RuntimeError('Data does not have a %s axis.' % self.axis)
@@ -103,6 +106,11 @@ class Rebin(task.SingleTask):
             # If we are on the final sub-channel then divide the arrays through
             if (iss + 1) % self.channel_bin == 0:
                 sb.vis[slc_sb] *= tools.invert_no_zero(sb.weight[slc_sb])
+
+        # If requested, delete the original data
+        if not self.keep:
+            del ss
+            gc.collect()
 
         return sb
 
