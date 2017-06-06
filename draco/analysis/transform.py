@@ -7,7 +7,7 @@ Tasks
 .. autosummary::
     :toctree:
 
-    FrequencyRebin
+    Rebin
     SelectFreq
     CollateProducts
     MModeTransform
@@ -19,71 +19,90 @@ from ..core import containers, task
 from ..util import tools
 
 
-class FrequencyRebin(task.SingleTask):
-    """Rebin neighbouring frequency channels.
+class Rebin(task.SingleTask):
+    """Rebin along an axis.
 
     Parameters
     ----------
     channel_bin : int
-        Number of channels to in together.
+        Number of channels to bin together.
+    axis : str
+        Rebin over this axis.  Default is 'freq'.
     """
 
     channel_bin = config.Property(proptype=int, default=1)
+    axis = config.Property(proptype=str, default='freq')
 
     def process(self, ss):
-        """Take the input dataset and rebin the frequencies.
+        """Take the input dataset and rebin over specificed axis.
 
         Parameters
         ----------
         ss : containers.SiderealStream or containers.TimeStream
-            Input data to rebin. Can also be an `andata.CorrData` instance,
-            however the output will be a `containers.TimeStream` instance.
+            Input data to rebin.
 
         Returns
         -------
         sb : containers.SiderealStream or containers.TimeStream
-            Rebinned data. Type should match the input.
+            Rebinned data. Type will match the input.
         """
 
-        if 'freq' not in ss.index_map:
-            raise RuntimeError('Data does not have a frequency axis.')
+        if self.axis not in ss.index_map:
+            raise RuntimeError('Data does not have a %s axis.' % self.axis)
 
-        if len(ss.freq) % self.channel_bin != 0:
-            raise RuntimeError("Binning must exactly divide the number of channels.")
+        # Calculate the largest number of elements that channel_bin will evenly divide
+        nax = (len(ss.index_map[self.axis]) / self.channel_bin) * self.channel_bin
 
-        # Get all frequencies onto same node
-        ss.redistribute(['time', 'ra'])
+        # Calculate the rebinned axis
+        if self.axis == 'freq':
+            fc = ss.index_map['freq']['centre'][:nax].reshape(-1, self.channel_bin).mean(axis=-1)
+            fw = ss.index_map['freq']['width'][:nax].reshape(-1, self.channel_bin).sum(axis=-1)
 
-        # Calculate the new frequency centres and widths
-        fc = ss.index_map['freq']['centre'].reshape(-1, self.channel_bin).mean(axis=-1)
-        fw = ss.index_map['freq']['width'].reshape(-1, self.channel_bin).sum(axis=-1)
+            ax = np.empty(fc.shape[0], dtype=ss.index_map['freq'].dtype)
+            ax['centre'] = fc
+            ax['width'] = fw
 
-        freq_map = np.empty(fc.shape[0], dtype=ss.index_map['freq'].dtype)
-        freq_map['centre'] = fc
-        freq_map['width'] = fw
+        else:
+            ax = getattr(ss, self.axis) if hasattr(ss, self.axis) else ss.index_map[self.axis]
+
+            ax = ax[:nax].reshape(-1, self.channel_bin).mean(axis=-1)
 
         # Create new container for rebinned stream
-        sb = containers.empty_like(ss, freq=freq_map)
+        kwargs = {self.axis:ax}
+        sb = containers.empty_like(ss, **kwargs)
 
-        # Get all frequencies onto same node
-        sb.redistribute(['time', 'ra'])
+        # Redistribute over an appropriate axis
+        axis_redist = ['freq', 'time', 'ra']
+        if self.axis in axis_redist:
+            axis_redist.remove(self.axis)
+        axis_redist = [name for name in axis_redist if name in ss.index_map][0]
+
+        ss.redistribute(axis_redist)
+        sb.redistribute(axis_redist)
+
+        # Create slice into datasets
+        slc_ss = [slice(None)] * len(ss.vis.shape)
+        slc_sb = [slice(None)] * len(ss.vis.shape)
+        iax = list(ss.vis.attrs['axis']).index(self.axis)
 
         # Rebin the arrays, do this with a loop to save memory
-        for fi in range(len(ss.freq)):
+        for iss in range(nax):
 
             # Calculate rebinned index
-            ri = fi / self.channel_bin
+            isb = iss / self.channel_bin
 
-            sb.vis[ri] += ss.vis[fi] * ss.weight[fi]
-            sb.gain[ri] += ss.gain[fi] / self.channel_bin  # Don't do weighted average for the moment
+            slc_ss[iax] = iss
+            slc_sb[iax] = isb
 
-            sb.weight[ri] += ss.weight[fi]
+            # Accumulate
+            sb.vis[slc_sb] += ss.vis[slc_ss] * ss.weight[slc_ss]
+            sb.gain[slc_sb] += ss.gain[slc_ss] / self.channel_bin  # Don't do weighted average for the moment
+
+            sb.weight[slc_sb] += ss.weight[slc_ss]
 
             # If we are on the final sub-channel then divide the arrays through
-            if (fi + 1) % self.channel_bin == 0:
-                sb.vis[ri] *= tools.invert_no_zero(sb.weight[ri])
-
-        sb.redistribute('freq')
+            if (iss + 1) % self.channel_bin == 0:
+                sb.vis[slc_sb] *= tools.invert_no_zero(sb.weight[slc_sb])
 
         return sb
 

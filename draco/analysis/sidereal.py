@@ -22,11 +22,12 @@ into  :class:`SiderealGrouper`, then feeding that into
 
 
 import numpy as np
+import os
 
 from caput import config, mpiutil, mpiarray, tod
 
 from ..core import task, containers
-from ..util import regrid
+from ..util import regrid, tools
 
 
 class SiderealGrouper(task.SingleTask):
@@ -34,12 +35,12 @@ class SiderealGrouper(task.SingleTask):
 
     Attributes
     ----------
-    padding : float
-        Extra amount of a sidereal day to pad each timestream by. Useful for
-        getting rid of interpolation artifacts.
+    min_day_length : float
+        Only process partial sidereal days whose length is greater
+        than this fraction of the whole sidereal day.
     """
 
-    padding = config.Property(proptype=float, default=0.005)
+    min_day_length = config.Property(proptype=float, default=0.1)
 
     def __init__(self):
         self._timestream_list = []
@@ -131,8 +132,11 @@ class SiderealGrouper(task.SingleTask):
         end = self.observer.unix_to_lsd(self._timestream_list[-1].time[-1])
         day_length = min(end, lsd + 1) - max(start, lsd)
 
+        if mpiutil.rank0:
+            print "Day length %0.2f" % day_length
+
         # If the amount of data for this day is too small, then just skip
-        if day_length < 0.1:
+        if day_length < self.min_day_length:
             return None
 
         if self._timestream_list[0].vis.comm.rank == 0:
@@ -161,10 +165,16 @@ class SiderealRegridder(task.SingleTask):
         Number of samples across the sidereal day.
     lanczos_width : int
         Width of the Lanczos interpolation kernel.
+    weight_scale_factor : float
+        Multiply weights by this factor to prevent overflow.
+    signal_inv_var : float
+        Inverse variance of signal for Weiner filter.
     """
 
     samples = config.Property(proptype=int, default=1024)
     lanczos_width = config.Property(proptype=int, default=5)
+    weight_scale_factor = config.Property(proptype=float, default=1e-7)
+    signal_inv_var = config.Property(proptype=float, default=5e-3)
 
     def setup(self, observer):
         """Set the local observers position.
@@ -212,15 +222,22 @@ class SiderealRegridder(task.SingleTask):
         lzf = regrid.lanczos_forward_matrix(lsd_grid, timestamp_lsd, self.lanczos_width).T.copy()
 
         # Mask data
-        imask = data.weight[:].view(np.ndarray)
         vis_data = data.vis[:].view(np.ndarray)
+        imask = data.weight[:].view(np.ndarray)
 
         # Reshape data
         vr = vis_data.reshape(-1, vis_data.shape[-1])
         nr = imask.reshape(-1, vis_data.shape[-1])
 
+        # Ensure that the median inverse noise variance is on the order 1.0
+        nr *= self.weight_scale_factor
+
+        # Mean subtract visibilities
+        mu = (np.sum(nr * vr, axis=-1) * tools.invert_no_zero(np.sum(nr, axis=-1)))[:, np.newaxis]
+        vr -= mu
+
         # Construct a signal 'covariance'
-        Si = np.ones_like(lsd_grid) * 1e-8
+        Si = np.ones_like(lsd_grid) * self.signal_inv_var
 
         # Calculate the interpolated data and a noise weight at the points in the padded grid
         sts, ni = regrid.band_wiener(lzf, nr, Si, vr, 2 * self.lanczos_width - 1)
@@ -228,6 +245,10 @@ class SiderealRegridder(task.SingleTask):
         # Throw away the padded ends
         sts = sts[:, pad:-pad].copy()
         ni = ni[:, pad:-pad].copy()
+
+        # Add mean back to visibilities and rescale noise
+        sts += mu * (np.abs(sts) > 0)
+        ni /= self.weight_scale_factor
 
         # Reshape to the correct shape
         sts = sts.reshape(vis_data.shape[:-1] + (self.samples,))
@@ -253,10 +274,36 @@ class SiderealStacker(task.SingleTask):
     """Take in a set of sidereal days, and stack them up.
 
     This will apply relative calibration.
+
+    Attributes
+    ----------
+    checkpoint : bool
+        Save the stack to disk after adding each sidereal day.
+
+    restart_from : str
+        Restart the stack from this file.
     """
 
+    checkpoint = config.Property(proptype=bool, default=False)
+    restart_from = config.Property(proptype=str, default=None)
+
     stack = None
-    lsd_list = None
+
+    def setup(self):
+        """ If requested, restart the stack from file saved to disk.
+        """
+
+        if (self.restart_from is not None) and os.path.isfile(self.restart_from):
+
+            if mpiutil.rank0:
+                print "Restarting stack from: %s" % self.restart_from
+
+            # Load sidereal stack from disk
+            self.stack = containers.SiderealStream.from_file(self.restart_from, distributed=True)
+
+            # Redistribute over the frequency axis
+            self.stack.redistribute('freq')
+
 
     def process(self, sdata):
         """Stack up sidereal days.
@@ -279,10 +326,13 @@ class SiderealStacker(task.SingleTask):
         else:
             input_lsd = -1
 
-        input_lsd = _ensure_list(input_lsd)
+        input_lsd = _ensure_list(input_lsd, array=True)
 
 
         if self.stack is None:
+
+            if mpiutil.rank0:
+                print "Starting stack with LSD: %i" % input_lsd
 
             self.stack = containers.empty_like(sdata)
             self.stack.redistribute('freq')
@@ -290,23 +340,31 @@ class SiderealStacker(task.SingleTask):
             self.stack.vis[:] = sdata.vis[:] * sdata.weight[:]
             self.stack.weight[:] = sdata.weight[:]
 
-            self.lsd_list = input_lsd
+            self.stack.attrs['tag'] = 'stack'
+            self.stack.attrs['lsd'] = input_lsd
+
+        else:
+
+            if any([ ll in self.stack.attrs['lsd'] for ll in input_lsd ]):
+                if mpiutil.rank0:
+                    print "Skipping stack of LSD: %i" % input_lsd
+                return
 
             if mpiutil.rank0:
-                print "Starting stack with LSD:%i" % sdata.attrs['lsd']
+                print "Adding to stack LSD: %i" % input_lsd
 
-            return
+            # note: Eventually we should fix up gains
 
-        if mpiutil.rank0:
-            print "Adding LSD:%i to stack" % sdata.attrs['lsd']
+            # Combine stacks with inverse `noise' weighting
+            self.stack.vis[:] += (sdata.vis[:] * sdata.weight[:])
+            self.stack.weight[:] += sdata.weight[:]
 
-        # note: Eventually we should fix up gains
+            self.stack.attrs['lsd'] = np.append(self.stack.attrs['lsd'],
+                                                input_lsd)
 
-        # Combine stacks with inverse `noise' weighting
-        self.stack.vis[:] += (sdata.vis[:] * sdata.weight[:])
-        self.stack.weight[:] += sdata.weight[:]
 
-        self.lsd_list += input_lsd
+        # Checkpoint the stack
+        self._save_checkpoint()
 
 
     def process_finish(self):
@@ -318,21 +376,37 @@ class SiderealStacker(task.SingleTask):
             Stack of sidereal days.
         """
 
-        self.stack.attrs['tag'] = 'stack'
-        self.stack.attrs['lsd'] = np.array(self.lsd_list)
-
-        self.stack.vis[:] = np.where(self.stack.weight[:] == 0,
-                                     0.0,
-                                     self.stack.vis[:] / self.stack.weight[:])
+        self.stack.vis[:] *= tools.invert_no_zero(self.stack.weight[:].view(np.ndarray))
 
         return self.stack
 
 
-def _ensure_list(x):
+    def _save_checkpoint(self):
+
+        if self.checkpoint:
+
+            # Create a tag for the output file name
+            tag = self.stack.attrs['tag'] if 'tag' in self.stack.attrs else 'stack'
+
+            # Construct the filename
+            outfile = self.output_root + str(tag) + '.h5'
+
+            # Expand any variables in the path
+            outfile = os.path.expanduser(outfile)
+            outfile = os.path.expandvars(outfile)
+
+            self.write_output(outfile, self.stack)
+
+
+
+def _ensure_list(x, array=False):
 
     if hasattr(x, '__iter__'):
         y = [xx for xx in x]
     else:
         y = [x]
+
+    if array:
+        y = np.array(y)
 
     return y

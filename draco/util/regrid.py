@@ -82,7 +82,7 @@ def band_wiener(R, Ni, Si, y, bw):
 
         # Solve for the Wiener estimate
         xh[ki] = la.solveh_banded(Ci, xh[ki])
-        nw[ki] = Ci[-1]
+        nw[ki] = Ci[-1] - Si
 
     return xh, nw
 
